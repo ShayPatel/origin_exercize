@@ -75,12 +75,12 @@ describe('useAguiStream', () => {
     expect(result.current.isRunning).toBe(false)
   })
 
-  it('captures tool results from TOOL_CALL_RESULT events', () => {
+  it('captures tool results flushed by the following TEXT_MESSAGE_START', () => {
     const { result } = renderHook(() => useAguiStream(), { wrapper })
     act(() => result.current.sendMessage('register'))
 
+    // Real ADK event order: TOOL_CALL_RESULT arrives BEFORE TEXT_MESSAGE_START
     act(() => {
-      subject.next(makeEvent(EventType.TEXT_MESSAGE_START, { messageId: 'msg-2', role: 'assistant' }))
       subject.next(makeEvent(EventType.TOOL_CALL_RESULT, {
         messageId: 'msg-tool-1',
         toolCallId: 'tc1',
@@ -90,7 +90,39 @@ describe('useAguiStream', () => {
       }))
     })
 
+    // Tool result is parked — not yet in state
+    expect(result.current.toolResults).toHaveLength(0)
+
+    act(() => {
+      subject.next(makeEvent(EventType.TEXT_MESSAGE_START, { messageId: 'msg-2', role: 'assistant' }))
+    })
+
+    // Now the pending result is flushed with the correct messageId
     expect(result.current.toolResults).toHaveLength(1)
     expect(result.current.toolResults[0].toolCallName).toBe('register_user')
+    expect(result.current.toolResults[0].messageId).toBe('msg-2')
+  })
+
+  it('creates a placeholder message on RUN_FINISHED when tool result has no following text', () => {
+    const { result } = renderHook(() => useAguiStream(), { wrapper })
+    act(() => result.current.sendMessage('create something'))
+
+    act(() => {
+      subject.next(makeEvent(EventType.TOOL_CALL_RESULT, {
+        messageId: 'msg-tool-2',
+        toolCallId: 'tc2',
+        toolCallName: 'create_event',
+        role: 'tool',
+        content: '{"id":"abc","name":"Test"}',
+      }))
+      subject.next(makeEvent(EventType.RUN_FINISHED))
+    })
+
+    // A placeholder assistant message is created
+    const assistantMsgs = result.current.messages.filter(m => m.role === 'assistant')
+    expect(assistantMsgs).toHaveLength(1)
+    // Tool result is associated with that placeholder
+    expect(result.current.toolResults).toHaveLength(1)
+    expect(result.current.toolResults[0].messageId).toBe(assistantMsgs[0].id)
   })
 })

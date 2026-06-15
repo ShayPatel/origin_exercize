@@ -31,6 +31,19 @@ export function useAguiStream(): UseAguiStreamReturn {
   const threadIdRef = useRef<string>(crypto.randomUUID())
   const currentAssistantIdRef = useRef<string | null>(null)
   const subscriptionRef = useRef<{ unsubscribe: () => void } | null>(null)
+  // Tool results arrive before their associated TEXT_MESSAGE_START.
+  // Park them here and flush with the correct messageId when text begins.
+  const pendingToolResultsRef = useRef<Omit<ToolResult, 'messageId'>[]>([])
+
+  const flushPendingToolResults = (msgId: string) => {
+    if (pendingToolResultsRef.current.length === 0) return
+    const resolved: ToolResult[] = pendingToolResultsRef.current.map(tr => ({
+      ...tr,
+      messageId: msgId,
+    }))
+    pendingToolResultsRef.current = []
+    setToolResults(prev => [...prev, ...resolved])
+  }
 
   const sendMessage = useCallback((text: string) => {
     if (isRunning) return
@@ -43,6 +56,7 @@ export function useAguiStream(): UseAguiStreamReturn {
     setMessages(prev => [...prev, userMsg])
     setIsRunning(true)
     currentAssistantIdRef.current = null
+    pendingToolResultsRef.current = []
 
     const allMessages = [...messages, userMsg].map(m => ({
       id: m.id,
@@ -66,18 +80,15 @@ export function useAguiStream(): UseAguiStreamReturn {
           case EventType.TEXT_MESSAGE_START: {
             const msgId = (event as any).messageId ?? crypto.randomUUID()
             currentAssistantIdRef.current = msgId
-            setMessages(prev => [
-              ...prev,
-              { id: msgId, role: 'assistant', content: '' },
-            ])
+            setMessages(prev => [...prev, { id: msgId, role: 'assistant', content: '' }])
+            // Flush tool results that arrived before this text response
+            flushPendingToolResults(msgId)
             break
           }
           case EventType.TEXT_MESSAGE_CONTENT: {
             const { messageId, delta } = event as any
             setMessages(prev =>
-              prev.map(m =>
-                m.id === messageId ? { ...m, content: m.content + delta } : m
-              )
+              prev.map(m => m.id === messageId ? { ...m, content: m.content + delta } : m)
             )
             break
           }
@@ -89,27 +100,33 @@ export function useAguiStream(): UseAguiStreamReturn {
           case EventType.TOOL_CALL_RESULT: {
             const { toolCallId, toolCallName, content } = event as any
             const name = toolCallName ?? lastToolCallNameRef[toolCallId] ?? ''
-            setToolResults(prev => [
-              ...prev,
-              {
-                toolCallId,
-                toolCallName: name,
-                result: content,
-                messageId: currentAssistantIdRef.current ?? '',
-              },
-            ])
+            // Park — messageId will be assigned when the next TEXT_MESSAGE_START fires
+            pendingToolResultsRef.current = [
+              ...pendingToolResultsRef.current,
+              { toolCallId, toolCallName: name, result: content },
+            ]
             break
           }
-          case EventType.RUN_FINISHED:
+          case EventType.RUN_FINISHED: {
+            // Edge case: agent ended without a final text response.
+            // Create a placeholder message so widgets still render.
+            if (pendingToolResultsRef.current.length > 0) {
+              const msgId = crypto.randomUUID()
+              setMessages(prev => [...prev, { id: msgId, role: 'assistant', content: '' }])
+              flushPendingToolResults(msgId)
+            }
             setIsRunning(false)
             qc.invalidateQueries({ queryKey: ['events'] })
             break
+          }
           case EventType.RUN_ERROR:
+            pendingToolResultsRef.current = []
             setIsRunning(false)
             break
         }
       },
       error() {
+        pendingToolResultsRef.current = []
         setIsRunning(false)
       },
       complete() {
