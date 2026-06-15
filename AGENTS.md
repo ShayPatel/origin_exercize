@@ -52,7 +52,7 @@ cd core-backend && uv run pytest tests/ -v
 # Chat backend — 10 tests (agent construction + AG-UI SSE event translation)
 cd chat-backend && uv run pytest tests/ -v
 
-# Frontend — 17 tests (hook state machine, widget rendering, registry routing)
+# Frontend — 18 tests (hook state machine, widget rendering, registry routing)
 cd frontend && npx vitest run
 ```
 
@@ -106,7 +106,8 @@ cd frontend && npx vitest run
     │   │   └── agui/
     │   │       ├── GenerativeUiRenderer.tsx  Registry dispatcher
     │   │       ├── AguiTicketWidget.tsx      Registration confirmation card
-    │   │       └── AguiCapacityWidget.tsx    Capacity adjustment card
+    │   │       ├── AguiCapacityWidget.tsx    Capacity adjustment card
+    │   │       └── AguiEventWidget.tsx       Event-created confirmation card
     │   └── tests/
     │       ├── setup.ts
     │       ├── hooks/useAguiStream.test.ts
@@ -156,14 +157,15 @@ The chat panel is **not** an agent-only interface. Humans can type any question 
 - A `TOOL_CALL_RESULT` event is received **and**
 - The `toolCallName` maps to a known entry in `COMPONENT_REGISTRY` inside `GenerativeUiRenderer.tsx`
 
-Currently, only two tools trigger widgets:
+Currently three tools trigger widgets:
 
 | Tool | Widget | Why |
 |---|---|---|
-| `register_user` | `AguiTicketWidget` | Gives the user a visual confirmation card with an Unregister affordance |
+| `register_user` | `AguiTicketWidget` | Visual confirmation card with an Unregister affordance |
 | `update_event_capacity` | `AguiCapacityWidget` | Shows old → new capacity with a fill-rate progress bar |
+| `create_event` | `AguiEventWidget` | Event-created badge with date, capacity, and a "Register Someone" shortcut |
 
-All other tools (`list_events`, `get_event`, `create_event`, `unregister_user`) let the agent's plain-text description stand. Adding a new widget requires only: (1) write the component, (2) add one entry to `COMPONENT_REGISTRY` and one entry to `TOOL_TO_WIDGET`. No other code changes needed.
+All other tools (`list_events`, `get_event`, `unregister_user`) let the agent's plain-text description stand. Adding a new widget requires only: (1) write the component, (2) add one entry to `COMPONENT_REGISTRY` and one entry to `TOOL_TO_WIDGET`. No other code changes needed.
 
 The "Unregister" button on `AguiTicketWidget` does not call the REST API directly. It prefills the chat input with a natural-language string (e.g., "Unregister user alice from event Test Event") so the agent handles the cancellation, enforces the same business rules, and can ask for confirmation if needed.
 
@@ -252,3 +254,7 @@ All tools are defined in `core-backend/app/mcp_server.py` and delegate to `Event
 **`datetime.utcnow()` deprecation** — Python 3.12 marks `datetime.utcnow()` as deprecated. The codebase uses it throughout for simplicity (SQLite stores naive UTC datetimes). Migrating to `datetime.now(UTC)` requires making all datetime fields timezone-aware in SQLModel, which is a non-trivial migration. The deprecation warnings are suppressed in tests but should be addressed before production use.
 
 **`useAguiStream` test requires `QueryClientProvider`** — The hook calls `useQueryClient()` to invalidate the events cache on `RUN_FINISHED`. Tests that render this hook with `renderHook()` must provide a wrapper: `{ wrapper: ({ children }) => createElement(QueryClientProvider, { client: new QueryClient() }, children) }`.
+
+**`TOOL_CALL_RESULT` arrives before `TEXT_MESSAGE_START`** — ADK emits tool results synchronously as part of the same LLM turn that produced the tool call, before it begins streaming the final text response. In the hook, `currentAssistantIdRef` is still `null` when `TOOL_CALL_RESULT` fires. The fix is a `pendingToolResultsRef` — tool results are parked there (without a `messageId`) and flushed with the correct `messageId` when `TEXT_MESSAGE_START` fires next. If `RUN_FINISHED` arrives with results still pending (agent ended without a final text), a placeholder assistant message is synthesised to give widgets a parent `id` to attach to. Do **not** store `messageId: ''` as the initial value — `ChatMessage.tsx` filters `toolResults.filter(t => t.messageId === message.id)`, so an empty string never matches and the widget never renders.
+
+**FastMCP wraps tool results in `CallToolResult`** — MCP tool results are not returned as a flat dict. ADK receives the full `CallToolResult` wrapper: `{content: [{type:"text", text:"..."}], isError: false, structuredContent: {result: {...}}}`. The actual tool return value is at `structuredContent.result`. `GenerativeUiRenderer.tsx` uses `extractToolData()` to unwrap this before passing `data` to a widget. Widgets should always receive the raw tool return value (e.g. `EventDict`), not the wrapper.
